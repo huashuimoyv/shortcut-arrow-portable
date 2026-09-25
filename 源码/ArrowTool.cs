@@ -70,6 +70,23 @@ public sealed class ArrowSettings
     public bool IsHidden { get { var s = Read(); return s.ValueExisted && s.Value == ManagedValue; } }
     public bool HasBackup { get { return File.Exists(BackupPath); } }
 
+    // Returns true when Shell Icons\29 exists but the referenced icon file has been deleted
+    // (e.g. by a third-party tool's uninstaller), causing Windows to render a black box.
+    public bool IsBroken
+    {
+        get
+        {
+            var s = Read();
+            if (!s.ValueExisted || s.Value == ManagedValue) return false;
+            string val = s.Value ?? string.Empty;
+            int comma = val.LastIndexOf(',');
+            string path = comma >= 0 ? val.Substring(0, comma).Trim() : val.Trim();
+            if (string.IsNullOrEmpty(path)) return false;
+            path = Environment.ExpandEnvironmentVariables(path);
+            return !File.Exists(path);
+        }
+    }
+
     SavedSetting LoadBackup()
     {
         var settings = new System.Xml.XmlReaderSettings { DtdProcessing = System.Xml.DtdProcessing.Prohibit, XmlResolver = null };
@@ -91,7 +108,13 @@ public sealed class ArrowSettings
         {
             var saved = LoadBackup();
             if (!IsHidden && !Same(current, saved))
-                throw new InvalidOperationException("箭头设置已被其他工具修改。为保留这些更改，本次未覆盖。");
+            {
+                // If the external change left a broken/missing icon, silently discard
+                // that stale backup and continue — we're repairing the black-box state.
+                if (!IsBroken)
+                    throw new InvalidOperationException("箭头设置已被其他工具修改。为保留这些更改，本次未覆盖。");
+                File.Delete(BackupPath);
+            }
         }
         else
         {
@@ -119,7 +142,9 @@ public sealed class ArrowSettings
         if (!HasBackup) throw new InvalidOperationException("尚无本工具的备份，无需恢复。");
         var saved = LoadBackup();
         var current = Read();
-        if (!IsHidden && !Same(current, saved))
+        // When the current state is broken (icon file missing), allow restoring backup
+        // even if it no longer matches — the external tool has already cleaned up.
+        if (!IsHidden && !Same(current, saved) && !IsBroken)
             throw new InvalidOperationException("箭头设置已被其他工具修改。为保留这些更改，本次未覆盖。");
         using (var k = root.OpenSubKey(keyPath, true))
         {
@@ -144,6 +169,7 @@ public sealed class ArrowSettings
         File.Delete(BackupPath);
         // Keep the tiny icon asset available until Explorer releases its old setting.
     }
+
 
     public static byte[] BlankIcon()
     {
@@ -316,6 +342,22 @@ static class Program
                     for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) Check(bitmap.GetPixel(x,y).A == 0, "icon transparency");
                     passed++;
                 }
+                // Broken-state tests: simulate a third-party uninstaller that deletes its own
+                // icon file but leaves the registry pointing to it (causing a black box).
+                string brokenPath = Path.Combine(folder, "ghost.ico");
+                using (var k = root.CreateSubKey(key)) k.SetValue("29", brokenPath + ",0");
+                // File does not exist — IsBroken should be true.
+                Check(store.IsBroken, "IsBroken detects missing icon file"); passed++;
+                // Hide() should repair the broken state (override the stale backup guard).
+                store.Hide(); Check(store.IsHidden, "Hide repairs broken state"); passed++;
+                // Simulate another broken state with a backup present (backup diverged).
+                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", brokenPath + ",0");
+                Check(store.IsBroken, "IsBroken with backup present"); passed++;
+                store.Hide(); Check(store.IsHidden, "Hide repairs broken state with stale backup"); passed++;
+                // Restore() should also work through a broken state.
+                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", brokenPath + ",0");
+                Check(store.IsBroken, "IsBroken before Restore"); passed++;
+                store.Restore(); Check(!store.HasBackup && !store.IsBroken, "Restore resolves broken state"); passed++;
                 File.WriteAllText(report, "PASS: " + passed + " checks. Isolated HKCU test key only; production arrow setting unchanged.\r\n");
             }
             finally
@@ -426,17 +468,41 @@ sealed class MainForm : Form
             using (var root = Program.MachineRoot())
             {
                 var s = Program.Store(root);
-                status.Text = s.IsHidden ? "已设置：去除箭头" : "当前：" + (s.Read().ValueExisted ? "已有自定义设置" : "默认箭头");
+                bool broken = s.IsBroken;
+                if (s.IsHidden)
+                {
+                    status.Text = "已设置：去除箭头";
+                    status.ForeColor = Color.FromArgb(46, 90, 77);
+                }
+                else if (broken)
+                {
+                    status.Text = "检测到损坏的箭头设置（关联图标文件已丢失）";
+                    status.ForeColor = Color.FromArgb(160, 50, 30);
+                }
+                else
+                {
+                    status.Text = "当前：" + (s.Read().ValueExisted ? "已有自定义设置" : "默认箭头");
+                    status.ForeColor = Color.FromArgb(46, 90, 77);
+                }
+                // When broken: enable hide (to repair) and restore (to fall back to backup)
+                hide.Enabled = true;
                 restore.Enabled = s.HasBackup;
             }
         }
-        catch { status.Text = "暂时无法读取设置"; restore.Enabled = false; }
+        catch { status.Text = "暂时无法读取设置"; status.ForeColor = Color.FromArgb(46, 90, 77); restore.Enabled = false; }
     }
     void SetBusy(bool value) { busy = value; hide.Enabled = restart.Enabled = !value; restore.Enabled = !value; }
     async Task Change(string action)
     {
         SetBusy(true);
         bool success = false;
+        // Capture broken state before the action so we can show a tailored success message.
+        bool wasBroken = false;
+        try
+        {
+            using (var root = Program.MachineRoot()) wasBroken = Program.Store(root).IsBroken;
+        }
+        catch { }
         try
         {
             using (var p = Process.Start(new ProcessStartInfo(Application.ExecutablePath, action) { UseShellExecute = true, Verb = "runas" }))
@@ -452,7 +518,13 @@ sealed class MainForm : Form
         finally
         {
             SetBusy(false); UpdateStatus();
-            if (success) status.Text = action == "--hide" ? "已设置去除箭头；未生效请重启桌面。" : "已恢复原设置；未生效请重启桌面。";
+            if (success)
+            {
+                if (action == "--hide")
+                    status.Text = wasBroken ? "损坏的设置已修复，箭头已去除；未生效请重启桌面。" : "已设置去除箭头；未生效请重启桌面。";
+                else
+                    status.Text = wasBroken ? "损坏的设置已修复，已恢复原设置；未生效请重启桌面。" : "已恢复原设置；未生效请重启桌面。";
+            }
         }
     }
 }
