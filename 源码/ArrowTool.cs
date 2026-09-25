@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ameath (huashuimoyv)
+// Shortcut Arrow Portable (快捷方式箭头 · 便携版)
+// Licensed under the MIT License. See LICENSE in the project root for license information.
+
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -12,7 +17,12 @@ using System.Xml.Serialization;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("快捷方式箭头")]
+[assembly: System.Reflection.AssemblyProduct("Shortcut Arrow Portable")]
+[assembly: System.Reflection.AssemblyDescription("Windows 快捷方式箭头管理与图标美化工具")]
+[assembly: System.Reflection.AssemblyCompany("huashuimoyv")]
+[assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 Ameath (huashuimoyv). Licensed under MIT.")]
 [assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
 
 public class SavedSetting
 {

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ameath (huashuimoyv)
+// Shortcut Arrow Portable (快捷方式箭头 · 便携版)
+// Licensed under the MIT License. See LICENSE in the project root for license information.
+
 using System;
 using System.CodeDom.Compiler;
 using System.Diagnostics;

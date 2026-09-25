@@ -46,3 +46,10 @@ Windows 的原生箭头属于快捷方式类型的系统叠加图标，不能用
 https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shchangenotify
 https://github.com/memstechtips/Winhance/issues/255
 https://learn.microsoft.com/zh-cn/windows/win32/shell/links
+
+开源协议与声明：
+本项目为自由开源软件，遵循 MIT License 开源协议发布。
+您可以免费使用、学习、修改、分发与二次开发，但须保留原始版权声明与许可条款。
+本项目按“现状”提供，不提供任何明示或暗示的保证。在任何情况下，作者均不对因使用本软件或其衍生品所导致的任何损失或损害承担法律责任。
+项目主页：https://github.com/huashuimoyv/shortcut-arrow-portable
+
