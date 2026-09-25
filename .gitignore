@@ -1,0 +1,13 @@
+# Temporary and test artifacts
+*.tmp
+*.log
+*.obj
+*.pdb
+individual-test-result.txt
+test-result.txt
+
+# Editor / IDE artifacts
+.vs/
+.vscode/
+Thumbs.db
+[Dd]esktop.ini
