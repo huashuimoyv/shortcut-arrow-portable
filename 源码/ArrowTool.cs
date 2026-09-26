@@ -38,8 +38,9 @@ public sealed class ArrowSettings
     readonly RegistryKey root;
     readonly string keyPath, dataPath;
     string BackupPath { get { return Path.Combine(dataPath, "previous.xml"); } }
-    string IconPath { get { return Path.Combine(dataPath, "transparent-v1.ico"); } }
+    string IconPath { get { return Path.Combine(dataPath, "transparent-v2.ico"); } }
     string ManagedValue { get { return IconPath + ",0"; } }
+    string LegacyManagedValue { get { return Path.Combine(dataPath, "transparent-v1.ico") + ",0"; } }
 
     public ArrowSettings(RegistryKey root, string keyPath, string dataPath)
     { this.root = root; this.keyPath = keyPath; this.dataPath = dataPath; }
@@ -67,25 +68,28 @@ public sealed class ArrowSettings
     bool Same(SavedSetting a, SavedSetting b)
     { return a.ValueExisted == b.ValueExisted && (!a.ValueExisted || (a.Kind == b.Kind && a.Value == b.Value)); }
 
-    public bool IsHidden { get { var s = Read(); return s.ValueExisted && s.Value == ManagedValue; } }
+    public bool IsHidden { get { var s = Read(); return s.ValueExisted && string.Equals(s.Value, ManagedValue, StringComparison.OrdinalIgnoreCase); } }
+    public bool IsLegacyManaged { get { var s = Read(); return s.ValueExisted && string.Equals(s.Value, LegacyManagedValue, StringComparison.OrdinalIgnoreCase); } }
     public bool HasBackup { get { return File.Exists(BackupPath); } }
 
-    // Returns true when Shell Icons\29 exists but the referenced icon file has been deleted
-    // (e.g. by a third-party tool's uninstaller), causing Windows to render a black box.
-    public bool IsBroken
+    static bool IsSettingBroken(SavedSetting s, string managedValue, string legacyValue)
     {
-        get
-        {
-            var s = Read();
-            if (!s.ValueExisted || s.Value == ManagedValue) return false;
-            string val = s.Value ?? string.Empty;
-            int comma = val.LastIndexOf(',');
-            string path = comma >= 0 ? val.Substring(0, comma).Trim() : val.Trim();
-            if (string.IsNullOrEmpty(path)) return false;
-            path = Environment.ExpandEnvironmentVariables(path);
-            return !File.Exists(path);
-        }
+        if (!s.ValueExisted || string.Equals(s.Value, managedValue, StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.Equals(s.Value, legacyValue, StringComparison.OrdinalIgnoreCase)) return true;
+        string val = s.Value ?? string.Empty;
+        int comma = val.LastIndexOf(',');
+        string path = comma >= 0 ? val.Substring(0, comma).Trim() : val.Trim();
+        path = path.Trim('"');
+        if (string.IsNullOrEmpty(path)) return true;
+        path = Environment.ExpandEnvironmentVariables(path);
+        if (File.Exists(path)) return false;
+        if (!Path.IsPathRooted(path) && File.Exists(Path.Combine(Environment.SystemDirectory, path))) return false;
+        return true;
     }
+
+    // Returns true when Shell Icons\29 points to the old v1 all-zero icon (which triggers
+    // the Windows iconcache black-box bug on reboot/uninstall) or to a missing file.
+    public bool IsBroken { get { return IsSettingBroken(Read(), ManagedValue, LegacyManagedValue); } }
 
     SavedSetting LoadBackup()
     {
@@ -100,6 +104,22 @@ public sealed class ArrowSettings
         }
     }
 
+    void WriteBackup(SavedSetting setting)
+    {
+        string temp = BackupPath + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write))
+            {
+                new XmlSerializer(typeof(SavedSetting)).Serialize(stream, setting);
+                stream.Flush(true);
+            }
+            if (File.Exists(BackupPath)) File.Delete(BackupPath);
+            File.Move(temp, BackupPath);
+        }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
+    }
+
     public void Hide()
     {
         var current = Read();
@@ -107,32 +127,26 @@ public sealed class ArrowSettings
         if (HasBackup)
         {
             var saved = LoadBackup();
-            if (!IsHidden && !Same(current, saved))
+            if (!IsHidden && !IsLegacyManaged && !Same(current, saved))
             {
-                // If the external change left a broken/missing icon, silently discard
-                // that stale backup and continue — we're repairing the black-box state.
                 if (!IsBroken)
                     throw new InvalidOperationException("箭头设置已被其他工具修改。为保留这些更改，本次未覆盖。");
-                File.Delete(BackupPath);
+                // Current state is broken: keep existing backup if it's healthy, otherwise reset backup to default arrow.
+                if (IsSettingBroken(saved, ManagedValue, LegacyManagedValue))
+                    WriteBackup(new SavedSetting { KeyExisted = current.KeyExisted, ValueExisted = false, Kind = 0 });
             }
         }
         else
         {
             if (IsHidden) throw new InvalidOperationException("找不到原设置备份，未继续修改。");
-            string temp = BackupPath + ".tmp-" + Guid.NewGuid().ToString("N");
-            try
-            {
-                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write))
-                {
-                    new XmlSerializer(typeof(SavedSetting)).Serialize(stream, current);
-                    stream.Flush(true);
-                }
-                File.Move(temp, BackupPath);
-            }
-            finally { if (File.Exists(temp)) File.Delete(temp); }
+            // Never back up a broken/missing icon path as the original setting; fall back to default arrow.
+            var toSave = IsBroken ? new SavedSetting { KeyExisted = current.KeyExisted, ValueExisted = false, Kind = 0 } : current;
+            WriteBackup(toSave);
         }
         // Keep the asset outside the portable EXE location, so moving the EXE is safe.
-        if (!File.Exists(IconPath)) File.WriteAllBytes(IconPath, BlankIcon());
+        byte[] iconBytes = BlankIcon();
+        File.WriteAllBytes(IconPath, iconBytes);
+        try { File.WriteAllBytes(Path.Combine(dataPath, "transparent-v1.ico"), iconBytes); } catch { }
         using (var k = root.CreateSubKey(keyPath)) k.SetValue("29", ManagedValue, RegistryValueKind.String);
         if (!IsHidden) throw new IOException("设置写入后验证失败。");
     }
@@ -142,9 +156,7 @@ public sealed class ArrowSettings
         if (!HasBackup) throw new InvalidOperationException("尚无本工具的备份，无需恢复。");
         var saved = LoadBackup();
         var current = Read();
-        // When the current state is broken (icon file missing), allow restoring backup
-        // even if it no longer matches — the external tool has already cleaned up.
-        if (!IsHidden && !Same(current, saved) && !IsBroken)
+        if (!IsHidden && !IsLegacyManaged && !Same(current, saved) && !IsBroken)
             throw new InvalidOperationException("箭头设置已被其他工具修改。为保留这些更改，本次未覆盖。");
         using (var k = root.OpenSubKey(keyPath, true))
         {
@@ -170,10 +182,15 @@ public sealed class ArrowSettings
         // Keep the tiny icon asset available until Explorer releases its old setting.
     }
 
-
     public static byte[] BlankIcon()
     {
-        int[] sizes = { 16, 24, 32, 48, 64, 128 };
+        // Include all standard shell sizes up to 256x256 (SHIL_JUMBO).
+        // Windows Shell ImageList / iconcache_*.db has a legacy heuristic: if EVERY pixel in a
+        // 32-bpp DIB has Alpha == 0, Windows treats it as a non-alpha 0RGB bitmap and renders a
+        // solid opaque black square after reboot or icon-cache rebuild. Setting a single corner
+        // pixel to Alpha = 1 (1/255 = 0.39% opacity, invisible) with its AND-mask bit = 0 forces
+        // Windows to recognize and preserve the 32-bit alpha channel across reboots and rebuilds.
+        int[] sizes = { 16, 20, 24, 32, 40, 48, 64, 128, 256 };
         using (var ms = new MemoryStream())
         using (var w = new BinaryWriter(ms))
         {
@@ -192,8 +209,13 @@ public sealed class ArrowSettings
                 w.Write(40); w.Write(n); w.Write(n * 2); w.Write((ushort)1); w.Write((ushort)32);
                 w.Write(0); w.Write(n * n * 4 + maskSize);
                 w.Write(0); w.Write(0); w.Write(0); w.Write(0);
-                w.Write(new byte[n * n * 4]);
-                for (int i = 0; i < maskSize; i++) w.Write((byte)255);
+                byte[] xor = new byte[n * n * 4];
+                xor[3] = 1; // 1 pixel with Alpha=1 (B=0,G=0,R=0,A=1) so Windows preserves 32-bpp alpha
+                w.Write(xor);
+                byte[] andMask = new byte[maskSize];
+                for (int i = 0; i < maskSize; i++) andMask[i] = 255;
+                andMask[0] = 0x7F; // unmask first pixel bit
+                w.Write(andMask);
             }
             return ms.ToArray();
         }
@@ -279,6 +301,25 @@ static class Program
         }
     }
 
+    public static void PurgeIconCache()
+    {
+        try
+        {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string legacyDb = Path.Combine(local, "IconCache.db");
+            if (File.Exists(legacyDb)) { try { File.SetAttributes(legacyDb, FileAttributes.Normal); File.Delete(legacyDb); } catch { } }
+            string explorerDir = Path.Combine(local, @"Microsoft\Windows\Explorer");
+            if (Directory.Exists(explorerDir))
+            {
+                foreach (string f in Directory.GetFiles(explorerDir, "iconcache*.db"))
+                {
+                    try { File.SetAttributes(f, FileAttributes.Normal); File.Delete(f); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
     public static async Task RestartDesktop()
     {
         uint pid;
@@ -291,6 +332,7 @@ static class Program
             p.Kill();
             await Task.Run(() => p.WaitForExit(5000));
         }
+        PurgeIconCache();
         // Windows normally restarts its shell itself; only launch it if needed.
         for (int i = 0; i < 16 && GetShellWindow() == IntPtr.Zero; i++) await Task.Delay(250);
         if (GetShellWindow() == IntPtr.Zero)
@@ -314,50 +356,63 @@ static class Program
                 var store = new ArrowSettings(root, key, folder);
                 store.Hide(); Check(store.IsHidden && store.HasBackup, "hide missing value"); passed++;
                 store.Hide(); store.Restore(); Check(!store.Read().KeyExisted && !store.HasBackup, "repeat hide / restore absent key"); passed++;
-                using (var k = root.CreateSubKey(key)) { k.SetValue("29", @"%SystemRoot%\original.ico,3", RegistryValueKind.ExpandString); k.SetValue("other", "keep"); }
+                using (var k = root.CreateSubKey(key)) { k.SetValue("29", @"%SystemRoot%\System32\shell32.dll,3", RegistryValueKind.ExpandString); k.SetValue("other", "keep"); }
                 store.Hide(); store.Restore();
                 var original = store.Read();
-                Check(original.Value == @"%SystemRoot%\original.ico,3" && original.Kind == (int)RegistryValueKind.ExpandString, "preserve original type and value"); passed++;
+                Check(original.Value == @"%SystemRoot%\System32\shell32.dll,3" && original.Kind == (int)RegistryValueKind.ExpandString, "preserve original type and value"); passed++;
                 using (var k = root.OpenSubKey(key)) Check((string)k.GetValue("other") == "keep", "preserve unrelated value"); passed++;
                 store.Hide();
-                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", "external.ico,0");
+                string externalFile = Path.Combine(folder, "external.ico");
+                File.WriteAllBytes(externalFile, ArrowSettings.BlankIcon());
+                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", externalFile + ",0");
                 bool refused = false;
                 try { store.Restore(); } catch (InvalidOperationException) { refused = true; }
-                Check(refused && store.HasBackup && store.Read().Value == "external.ico,0", "external changes protected"); passed++;
+                Check(refused && store.HasBackup && store.Read().Value == externalFile + ",0", "external changes protected"); passed++;
                 refused = false;
                 try { store.Hide(); } catch (InvalidOperationException) { refused = true; }
                 Check(refused, "hide respects external changes"); passed++;
-                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", @"%SystemRoot%\original.ico,3", RegistryValueKind.ExpandString);
+                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", @"%SystemRoot%\System32\shell32.dll,3", RegistryValueKind.ExpandString);
                 store.Restore(); Check(!store.HasBackup, "recover already-restored state"); passed++;
                 using (var k = root.OpenSubKey(key, true)) k.SetValue("29", 123, RegistryValueKind.DWord);
                 refused = false;
                 try { store.Hide(); } catch (InvalidOperationException) { refused = true; }
                 Check(refused && !store.HasBackup, "unsupported value type protected"); passed++;
-                foreach (int n in new[] {16,24,32,48,64,128})
+                foreach (int n in new[] {16,20,24,32,40,48,64,128})
                 using (var stream = new MemoryStream(ArrowSettings.BlankIcon()))
                 using (var icon = new Icon(stream, n, n))
                 using (var bitmap = icon.ToBitmap())
                 {
                     Check(bitmap.Width == n && bitmap.Height == n, "icon size: requested " + n + ", actual " + bitmap.Width);
-                    for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) Check(bitmap.GetPixel(x,y).A == 0, "icon transparency");
+                    int alphaOne = 0;
+                    for (int y = 0; y < n; y++)
+                        for (int x = 0; x < n; x++)
+                        {
+                            int a = bitmap.GetPixel(x, y).A;
+                            Check(a <= 1, "icon near-zero transparency");
+                            if (a == 1) alphaOne++;
+                        }
+                    Check(alphaOne == 1, "anti-black-box Alpha=1 marker pixel present");
                     passed++;
                 }
                 // Broken-state tests: simulate a third-party uninstaller that deletes its own
                 // icon file but leaves the registry pointing to it (causing a black box).
                 string brokenPath = Path.Combine(folder, "ghost.ico");
                 using (var k = root.CreateSubKey(key)) k.SetValue("29", brokenPath + ",0");
-                // File does not exist — IsBroken should be true.
                 Check(store.IsBroken, "IsBroken detects missing icon file"); passed++;
-                // Hide() should repair the broken state (override the stale backup guard).
                 store.Hide(); Check(store.IsHidden, "Hide repairs broken state"); passed++;
-                // Simulate another broken state with a backup present (backup diverged).
                 using (var k = root.OpenSubKey(key, true)) k.SetValue("29", brokenPath + ",0");
                 Check(store.IsBroken, "IsBroken with backup present"); passed++;
                 store.Hide(); Check(store.IsHidden, "Hide repairs broken state with stale backup"); passed++;
-                // Restore() should also work through a broken state.
                 using (var k = root.OpenSubKey(key, true)) k.SetValue("29", brokenPath + ",0");
                 Check(store.IsBroken, "IsBroken before Restore"); passed++;
                 store.Restore(); Check(!store.HasBackup && !store.IsBroken, "Restore resolves broken state"); passed++;
+                // Legacy v1 upgrade test: simulate v1 icon with existing backup, verify upgrade to v2 preserves backup.
+                using (var k = root.CreateSubKey(key)) k.SetValue("29", @"%SystemRoot%\System32\shell32.dll,3", RegistryValueKind.ExpandString);
+                store.Hide();
+                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", Path.Combine(folder, "transparent-v1.ico") + ",0");
+                Check(store.IsLegacyManaged && store.IsBroken, "detect legacy v1 icon"); passed++;
+                store.Hide(); Check(store.IsHidden && !store.IsBroken, "upgrade v1 to v2"); passed++;
+                store.Restore(); Check(store.Read().Value == @"%SystemRoot%\System32\shell32.dll,3", "restore original after v1->v2 upgrade"); passed++;
                 File.WriteAllText(report, "PASS: " + passed + " checks. Isolated HKCU test key only; production arrow setting unchanged.\r\n");
             }
             finally
@@ -473,6 +528,11 @@ sealed class MainForm : Form
                 {
                     status.Text = "已设置：去除箭头";
                     status.ForeColor = Color.FromArgb(46, 90, 77);
+                }
+                else if (s.IsLegacyManaged)
+                {
+                    status.Text = "检测到旧版透明图标（易出现黑块，请点去除箭头修复）";
+                    status.ForeColor = Color.FromArgb(160, 50, 30);
                 }
                 else if (broken)
                 {
