@@ -38,9 +38,14 @@ public sealed class ArrowSettings
     readonly RegistryKey root;
     readonly string keyPath, dataPath;
     string BackupPath { get { return Path.Combine(dataPath, "previous.xml"); } }
-    string IconPath { get { return Path.Combine(dataPath, "transparent-v2.ico"); } }
+    string IconPath { get { return Path.Combine(dataPath, "transparent-v3.ico"); } }
     string ManagedValue { get { return IconPath + ",0"; } }
-    string LegacyManagedValue { get { return Path.Combine(dataPath, "transparent-v1.ico") + ",0"; } }
+
+    static bool IsLegacyValue(string val, string dataPath)
+    {
+        return string.Equals(val, Path.Combine(dataPath, "transparent-v1.ico") + ",0", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(val, Path.Combine(dataPath, "transparent-v2.ico") + ",0", StringComparison.OrdinalIgnoreCase);
+    }
 
     public ArrowSettings(RegistryKey root, string keyPath, string dataPath)
     { this.root = root; this.keyPath = keyPath; this.dataPath = dataPath; }
@@ -69,13 +74,13 @@ public sealed class ArrowSettings
     { return a.ValueExisted == b.ValueExisted && (!a.ValueExisted || (a.Kind == b.Kind && a.Value == b.Value)); }
 
     public bool IsHidden { get { var s = Read(); return s.ValueExisted && string.Equals(s.Value, ManagedValue, StringComparison.OrdinalIgnoreCase); } }
-    public bool IsLegacyManaged { get { var s = Read(); return s.ValueExisted && string.Equals(s.Value, LegacyManagedValue, StringComparison.OrdinalIgnoreCase); } }
+    public bool IsLegacyManaged { get { var s = Read(); return s.ValueExisted && IsLegacyValue(s.Value, dataPath); } }
     public bool HasBackup { get { return File.Exists(BackupPath); } }
 
-    static bool IsSettingBroken(SavedSetting s, string managedValue, string legacyValue)
+    static bool IsSettingBroken(SavedSetting s, string managedValue, string dataPath)
     {
         if (!s.ValueExisted || string.Equals(s.Value, managedValue, StringComparison.OrdinalIgnoreCase)) return false;
-        if (string.Equals(s.Value, legacyValue, StringComparison.OrdinalIgnoreCase)) return true;
+        if (IsLegacyValue(s.Value, dataPath)) return true;
         string val = s.Value ?? string.Empty;
         int comma = val.LastIndexOf(',');
         string path = comma >= 0 ? val.Substring(0, comma).Trim() : val.Trim();
@@ -87,9 +92,9 @@ public sealed class ArrowSettings
         return true;
     }
 
-    // Returns true when Shell Icons\29 points to the old v1 all-zero icon (which triggers
-    // the Windows iconcache black-box bug on reboot/uninstall) or to a missing file.
-    public bool IsBroken { get { return IsSettingBroken(Read(), ManagedValue, LegacyManagedValue); } }
+    // Returns true when Shell Icons\29 points to an older v1/v2 icon (which can trigger
+    // the Windows iconcache black-box bug at 150% DPI or on reboot) or to a missing file.
+    public bool IsBroken { get { return IsSettingBroken(Read(), ManagedValue, dataPath); } }
 
     SavedSetting LoadBackup()
     {
@@ -132,7 +137,7 @@ public sealed class ArrowSettings
                 if (!IsBroken)
                     throw new InvalidOperationException("箭头设置已被其他工具修改。为保留这些更改，本次未覆盖。");
                 // Current state is broken: keep existing backup if it's healthy, otherwise reset backup to default arrow.
-                if (IsSettingBroken(saved, ManagedValue, LegacyManagedValue))
+                if (IsSettingBroken(saved, ManagedValue, dataPath))
                     WriteBackup(new SavedSetting { KeyExisted = current.KeyExisted, ValueExisted = false, Kind = 0 });
             }
         }
@@ -147,6 +152,7 @@ public sealed class ArrowSettings
         byte[] iconBytes = BlankIcon();
         File.WriteAllBytes(IconPath, iconBytes);
         try { File.WriteAllBytes(Path.Combine(dataPath, "transparent-v1.ico"), iconBytes); } catch { }
+        try { File.WriteAllBytes(Path.Combine(dataPath, "transparent-v2.ico"), iconBytes); } catch { }
         using (var k = root.CreateSubKey(keyPath)) k.SetValue("29", ManagedValue, RegistryValueKind.String);
         if (!IsHidden) throw new IOException("设置写入后验证失败。");
     }
@@ -184,13 +190,14 @@ public sealed class ArrowSettings
 
     public static byte[] BlankIcon()
     {
-        // Include all standard shell sizes up to 256x256 (SHIL_JUMBO).
+        // Include all standard & high-DPI shell sizes (100%, 125%, 150%, 175%, 200%, 250%, 300%, 400%),
+        // specifically including 72x72 (SHIL_EXTRALARGE at 150% DPI) and 256x256 (SHIL_JUMBO).
         // Windows Shell ImageList / iconcache_*.db has a legacy heuristic: if EVERY pixel in a
         // 32-bpp DIB has Alpha == 0, Windows treats it as a non-alpha 0RGB bitmap and renders a
-        // solid opaque black square after reboot or icon-cache rebuild. Setting a single corner
-        // pixel to Alpha = 1 (1/255 = 0.39% opacity, invisible) with its AND-mask bit = 0 forces
-        // Windows to recognize and preserve the 32-bit alpha channel across reboots and rebuilds.
-        int[] sizes = { 16, 20, 24, 32, 40, 48, 64, 128, 256 };
+        // solid opaque black square. Furthermore, a single Alpha=1 pixel gets averaged down to 0
+        // under bilinear downscaling. Painting a max(4, n/4) patch with Alpha = 2 (0.78% opacity,
+        // completely invisible) and unmasked AND-bits guarantees non-zero alpha survives any scaling.
+        int[] sizes = { 16, 20, 24, 32, 36, 40, 48, 60, 64, 72, 80, 96, 128, 256 };
         using (var ms = new MemoryStream())
         using (var w = new BinaryWriter(ms))
         {
@@ -205,16 +212,24 @@ public sealed class ArrowSettings
             }
             foreach (int n in sizes)
             {
-                int maskSize = ((n + 31) / 32 * 4) * n;
+                int rowStride = (n + 31) / 32 * 4;
+                int maskSize = rowStride * n;
                 w.Write(40); w.Write(n); w.Write(n * 2); w.Write((ushort)1); w.Write((ushort)32);
                 w.Write(0); w.Write(n * n * 4 + maskSize);
                 w.Write(0); w.Write(0); w.Write(0); w.Write(0);
                 byte[] xor = new byte[n * n * 4];
-                xor[3] = 1; // 1 pixel with Alpha=1 (B=0,G=0,R=0,A=1) so Windows preserves 32-bpp alpha
-                w.Write(xor);
                 byte[] andMask = new byte[maskSize];
                 for (int i = 0; i < maskSize; i++) andMask[i] = 255;
-                andMask[0] = 0x7F; // unmask first pixel bit
+                int patch = Math.Max(4, n / 4);
+                for (int y = 0; y < patch; y++)
+                {
+                    for (int x = 0; x < patch; x++)
+                    {
+                        xor[(y * n + x) * 4 + 3] = 2; // Alpha = 2 (0.78% opacity, visually imperceptible)
+                        andMask[y * rowStride + (x >> 3)] &= (byte)~(0x80 >> (x & 7));
+                    }
+                }
+                w.Write(xor);
                 w.Write(andMask);
             }
             return ms.ToArray();
@@ -329,10 +344,14 @@ static class Program
         {
             if (p.ProcessName != "explorer" || p.SessionId != Process.GetCurrentProcess().SessionId)
                 throw new InvalidOperationException("无法确认当前桌面进程，请注销后重新登录。");
-            p.Kill();
-            await Task.Run(() => p.WaitForExit(5000));
+            await Task.Run(() =>
+            {
+                PurgeIconCache();
+                p.Kill();
+                p.WaitForExit(5000);
+                PurgeIconCache();
+            });
         }
-        PurgeIconCache();
         // Windows normally restarts its shell itself; only launch it if needed.
         for (int i = 0; i < 16 && GetShellWindow() == IntPtr.Zero; i++) await Task.Delay(250);
         if (GetShellWindow() == IntPtr.Zero)
@@ -377,21 +396,22 @@ static class Program
                 refused = false;
                 try { store.Hide(); } catch (InvalidOperationException) { refused = true; }
                 Check(refused && !store.HasBackup, "unsupported value type protected"); passed++;
-                foreach (int n in new[] {16,20,24,32,40,48,64,128})
+                foreach (int n in new[] {16,20,24,32,36,40,48,60,64,72,80,96,128})
                 using (var stream = new MemoryStream(ArrowSettings.BlankIcon()))
                 using (var icon = new Icon(stream, n, n))
                 using (var bitmap = icon.ToBitmap())
                 {
                     Check(bitmap.Width == n && bitmap.Height == n, "icon size: requested " + n + ", actual " + bitmap.Width);
-                    int alphaOne = 0;
+                    int alphaTwo = 0;
+                    int patch = Math.Max(4, n / 4);
                     for (int y = 0; y < n; y++)
                         for (int x = 0; x < n; x++)
                         {
                             int a = bitmap.GetPixel(x, y).A;
-                            Check(a <= 1, "icon near-zero transparency");
-                            if (a == 1) alphaOne++;
+                            Check(a <= 2, "icon near-zero transparency");
+                            if (a == 2) alphaTwo++;
                         }
-                    Check(alphaOne == 1, "anti-black-box Alpha=1 marker pixel present");
+                    Check(alphaTwo == patch * patch, "anti-black-box Alpha=2 patch present");
                     passed++;
                 }
                 // Broken-state tests: simulate a third-party uninstaller that deletes its own
@@ -406,13 +426,16 @@ static class Program
                 using (var k = root.OpenSubKey(key, true)) k.SetValue("29", brokenPath + ",0");
                 Check(store.IsBroken, "IsBroken before Restore"); passed++;
                 store.Restore(); Check(!store.HasBackup && !store.IsBroken, "Restore resolves broken state"); passed++;
-                // Legacy v1 upgrade test: simulate v1 icon with existing backup, verify upgrade to v2 preserves backup.
+                // Legacy v1/v2 upgrade test: simulate v1/v2 icon with existing backup, verify upgrade to v3 preserves backup.
                 using (var k = root.CreateSubKey(key)) k.SetValue("29", @"%SystemRoot%\System32\shell32.dll,3", RegistryValueKind.ExpandString);
                 store.Hide();
                 using (var k = root.OpenSubKey(key, true)) k.SetValue("29", Path.Combine(folder, "transparent-v1.ico") + ",0");
                 Check(store.IsLegacyManaged && store.IsBroken, "detect legacy v1 icon"); passed++;
-                store.Hide(); Check(store.IsHidden && !store.IsBroken, "upgrade v1 to v2"); passed++;
-                store.Restore(); Check(store.Read().Value == @"%SystemRoot%\System32\shell32.dll,3", "restore original after v1->v2 upgrade"); passed++;
+                store.Hide(); Check(store.IsHidden && !store.IsBroken, "upgrade v1 to v3"); passed++;
+                using (var k = root.OpenSubKey(key, true)) k.SetValue("29", Path.Combine(folder, "transparent-v2.ico") + ",0");
+                Check(store.IsLegacyManaged && store.IsBroken, "detect legacy v2 icon"); passed++;
+                store.Hide(); Check(store.IsHidden && !store.IsBroken, "upgrade v2 to v3"); passed++;
+                store.Restore(); Check(store.Read().Value == @"%SystemRoot%\System32\shell32.dll,3", "restore original after v1/v2->v3 upgrade"); passed++;
                 File.WriteAllText(report, "PASS: " + passed + " checks. Isolated HKCU test key only; production arrow setting unchanged.\r\n");
             }
             finally
@@ -451,16 +474,19 @@ sealed class MainForm : Form
         Controls.Add(status);
         hide = MakeButton("去除箭头", 25, true);
         restore = MakeButton("恢复原样", 214, false);
-        hide.Click += async (s,e) => await Change("--hide");
-        restore.Click += async (s,e) => await Change("--restore");
+        hide.Click += async (s,e) => await Change("--hide", true);
+        restore.Click += async (s,e) => await Change("--restore", true);
         restart = new LinkLabel { Text = "重启桌面", Location = new Point(25,203), Size = new Size(88,25), LinkColor = Color.FromArgb(41,104,84), ActiveLinkColor = Color.FromArgb(27,76,62) };
         restart.LinkClicked += async (s,e) =>
         {
             if (MessageBox.Show(this, "桌面和任务栏会短暂消失，文件夹窗口可能关闭。\n请先完成文件复制或移动操作。\n\n现在重启桌面？", "重启桌面", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+            bool needUpgrade = false;
+            try { using (var root = Program.MachineRoot()) needUpgrade = Program.Store(root).IsLegacyManaged; } catch { }
+            if (needUpgrade && !await Change("--hide", false)) return;
             SetBusy(true);
-            try { await Program.RestartDesktop(); status.Text = "桌面已重启，请查看图标。"; }
-            catch (Exception ex) { MessageBox.Show(this, ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error); }
-            finally { SetBusy(false); }
+            try { await Program.RestartDesktop(); UpdateStatus(); status.Text = "桌面已重启，请查看图标。"; }
+            catch (Exception ex) { UpdateStatus(); MessageBox.Show(this, ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            finally { SetBusy(false); UpdateStatus(); if (!needUpgrade || status.Text.StartsWith("已设置")) status.Text = "桌面已重启，请查看图标。"; }
         };
         Controls.Add(restart);
         Controls.Add(new Label { Text = "未生效时使用，也可注销后重新登录", Font = new Font(Font.FontFamily, 9F), Location = new Point(112,205), Size = new Size(280,23), ForeColor = Color.Gray });
@@ -531,7 +557,7 @@ sealed class MainForm : Form
                 }
                 else if (s.IsLegacyManaged)
                 {
-                    status.Text = "检测到旧版透明图标（易出现黑块，请点去除箭头修复）";
+                    status.Text = "检测到旧版透明图标（请点去除箭头或重启桌面修复）";
                     status.ForeColor = Color.FromArgb(160, 50, 30);
                 }
                 else if (broken)
@@ -552,11 +578,11 @@ sealed class MainForm : Form
         catch { status.Text = "暂时无法读取设置"; status.ForeColor = Color.FromArgb(46, 90, 77); restore.Enabled = false; }
     }
     void SetBusy(bool value) { busy = value; hide.Enabled = restart.Enabled = !value; restore.Enabled = !value; }
-    async Task Change(string action)
+    async Task<bool> Change(string action, bool restartIfBroken)
     {
         SetBusy(true);
         bool success = false;
-        // Capture broken state before the action so we can show a tailored success message.
+        // Capture broken state before the action so we can show a tailored success message and refresh Explorer cache.
         bool wasBroken = false;
         try
         {
@@ -570,7 +596,11 @@ sealed class MainForm : Form
                 await Task.Run(() => p.WaitForExit());
                 success = p.ExitCode == 0;
             }
-            if (success) Program.Refresh();
+            if (success)
+            {
+                if (wasBroken && restartIfBroken) await Program.RestartDesktop();
+                else { Program.PurgeIconCache(); Program.Refresh(); }
+            }
         }
         catch (Win32Exception ex)
         { if (ex.NativeErrorCode != 1223) MessageBox.Show(this, ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error); }
@@ -581,10 +611,11 @@ sealed class MainForm : Form
             if (success)
             {
                 if (action == "--hide")
-                    status.Text = wasBroken ? "损坏的设置已修复，箭头已去除；未生效请重启桌面。" : "已设置去除箭头；未生效请重启桌面。";
+                    status.Text = wasBroken ? "旧版/损坏设置已修复并刷新桌面。" : "已设置去除箭头；未生效请重启桌面。";
                 else
-                    status.Text = wasBroken ? "损坏的设置已修复，已恢复原设置；未生效请重启桌面。" : "已恢复原设置；未生效请重启桌面。";
+                    status.Text = wasBroken ? "损坏的设置已修复，已恢复原设置并刷新桌面。" : "已恢复原设置；未生效请重启桌面。";
             }
         }
+        return success;
     }
 }
